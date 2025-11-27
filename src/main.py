@@ -207,7 +207,6 @@ class AutoBattlerClient:
 
     def build_shop(self) -> List[Dict]:
         slots: List[Dict] = []
-        start_x = 80
         bench_tiles = [t for t in self.tiles if t.is_bench]
         if bench_tiles:
             bench_bottom = max(t.center_y for t in bench_tiles)
@@ -216,6 +215,8 @@ class AutoBattlerClient:
             y = int(self.board_max_y + 160)
         y = min(y, SCREEN_HEIGHT - SHOP_CARD_H - 20)
         unit_types = ["Vanguard", "Ranger", "Mage"]
+        total_width = len(unit_types) * SHOP_CARD_W + (len(unit_types) - 1) * SHOP_CARD_MARGIN
+        start_x = int((SCREEN_WIDTH - total_width) / 2)
         for idx, utype in enumerate(unit_types):
             rect = pygame.Rect(
                 start_x + idx * (SHOP_CARD_W + SHOP_CARD_MARGIN),

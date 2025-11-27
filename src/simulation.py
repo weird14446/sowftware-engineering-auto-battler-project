@@ -325,8 +325,10 @@ class BattleSimulation:
                     )
             else:
                 if dist != 0:
-                    unit.x += (target.x - unit.x) / dist * unit.move_speed
-                    unit.y += (target.y - unit.y) / dist * unit.move_speed
+                    speed = unit.move_speed * (ACCEL_ATTACK_FACTOR if self.accelerated else 1)
+                    step = min(speed, dist)
+                    unit.x += (target.x - unit.x) / dist * step
+                    unit.y += (target.y - unit.y) / dist * step
 
             if unit.attack_cooldown > 0:
                 decrement = ACCEL_ATTACK_FACTOR if self.accelerated else 1
@@ -359,13 +361,6 @@ class BattleSimulation:
                 bullet.y += (dy / dist) * step
 
         self.bullets = [b for b in self.bullets if b.active]
-
-        match_alive: Dict[Optional[int], set] = {}
-        for u in self.units.values():
-            if u.status == "board" and u.hp > 0:
-                match_alive.setdefault(u.match_id, set()).add(u.owner_id)
-        if match_alive and all(len(owners) <= 1 for owners in match_alive.values()):
-            self.end_combat()
 
     # --- Serialization helpers ---
     def as_payload(self) -> Dict:

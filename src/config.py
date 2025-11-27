@@ -23,7 +23,7 @@ ATTACK_DELAY_TICKS = TICKS_PER_SECOND  # one second between attacks
 BULLET_HIT_RADIUS = 14
 BULLET_TTL_TICKS = TICKS_PER_SECOND * 3
 MELEE_RANGE_THRESHOLD = 90  # units with range <= this are treated as melee (no visible projectile)
-ACCEL_ATTACK_FACTOR = 3  # attack speed multiplier during accelerated combat
+ACCEL_ATTACK_FACTOR = 2  # attack speed multiplier during accelerated combat
 
 PREP_SECONDS = 30
 COMBAT_SECONDS = 30
@@ -42,5 +42,5 @@ UNIT_STATS = {
 UNIT_ART = {
     "Vanguard": {"idle": "vanguard.png", "attack": "vanguard_attack.png", "icon": "vanguard_icon.png"},
     "Ranger": {"idle": "ranger.png", "attack": "ranger_attack.png", "icon": "ranger_icon.png"},
-    "Mage": {"idle": None, "attack": None, "icon": None},
+    "Mage": {"idle": "mage.png", "attack": "mage_attack.png", "icon": "mage_icon.png"},
 }

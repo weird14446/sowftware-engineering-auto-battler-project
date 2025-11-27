@@ -190,21 +190,24 @@ class AutoBattlerServer:
     async def maybe_start_combat(self, *, force_timer: bool = False) -> None:
         if self.sim.phase != "placement":
             return
-        if not self.sessions:
+        alive_in_game = [s for s in self.sessions.values() if s.alive and s.in_game]
+        min_players = max(2, MIN_READY_TO_START)
+        if len(alive_in_game) < min_players:
             return
-        ready_players = [s for s in self.sessions.values() if s.ready and s.alive]
-        if len(ready_players) < max(2, MIN_READY_TO_START):
+        if force_timer:
+            await self.force_start(use_ready_only=False)
             return
-        if not force_timer and not all(s.ready for s in ready_players):
+        ready_players = [s for s in alive_in_game if s.ready]
+        if len(ready_players) < min_players:
             return
         await self.force_start()
 
-    async def force_start(self) -> None:
+    async def force_start(self, *, use_ready_only: bool = True) -> None:
         if self.sim.phase != "placement":
             return
         if not self.all_alive_in_game():
             return
-        pairs = self.make_pairs()
+        pairs = self.make_pairs(use_ready_only=use_ready_only)
         if not pairs:
             return
         self.sim.prepare_pairs(pairs)
@@ -279,8 +282,21 @@ class AutoBattlerServer:
                 "remaining": remaining_combat if not accel else remaining_accel,
             }
         else:
-            # Prep timer disabled; show static value
-            return {"phase": "placement", "remaining": PREP_SECONDS}
+            if self.phase_start_time is not None and self.should_run_prep_countdown():
+                remaining = max(0, PREP_SECONDS - (now - self.phase_start_time))
+            else:
+                remaining = PREP_SECONDS
+            return {"phase": "placement", "remaining": remaining}
+
+    def should_run_prep_countdown(self) -> bool:
+        if self.sim.phase != "placement":
+            return False
+        alive_in_game = [s for s in self.sessions.values() if s.alive and s.in_game]
+        if not alive_in_game:
+            return False
+        if self.round_number >= 2:
+            return True
+        return len(alive_in_game) >= MAX_PLAYERS
 
     def all_alive_in_game(self) -> bool:
         alive_sessions = [s for s in self.sessions.values() if s.alive]
@@ -304,12 +320,15 @@ class AutoBattlerServer:
         # All players place on friendly (bottom) during placement; server mirrors opponent on combat start.
         return "friendly"
 
-    def make_pairs(self) -> list:
-        ready_ids = [s.player_id for s in self.sessions.values() if s.ready and s.alive]
-        random.shuffle(ready_ids)
+    def make_pairs(self, *, use_ready_only: bool = True) -> list:
+        if use_ready_only:
+            ids = [s.player_id for s in self.sessions.values() if s.ready and s.alive and s.in_game]
+        else:
+            ids = [s.player_id for s in self.sessions.values() if s.alive and s.in_game]
+        random.shuffle(ids)
         pairs = []
-        for i in range(0, len(ready_ids) - 1, 2):
-            pairs.append((ready_ids[i], ready_ids[i + 1]))
+        for i in range(0, len(ids) - 1, 2):
+            pairs.append((ids[i], ids[i + 1]))
         return pairs
 
     # --- Main loop ---
@@ -334,6 +353,15 @@ class AutoBattlerServer:
                 await asyncio.sleep(1 / TICKS_PER_SECOND)
             else:
                 now = time.monotonic()
+                countdown_active = self.should_run_prep_countdown()
+                if countdown_active and self.phase_start_time is None:
+                    self.phase_start_time = now
+                if not countdown_active:
+                    self.phase_start_time = None
+                if countdown_active and self.phase_start_time is not None:
+                    elapsed = now - self.phase_start_time
+                    if elapsed >= PREP_SECONDS:
+                        await self.maybe_start_combat(force_timer=True)
                 if self.last_timer_broadcast is None or now - self.last_timer_broadcast >= 1.0:
                     self.last_timer_broadcast = now
                     await self.broadcast_lobby()
@@ -342,6 +370,7 @@ class AutoBattlerServer:
                     await self.broadcast_state()
                 await asyncio.sleep(0.15)
             if prev_phase == "combat" and self.sim.phase == "placement":
+                self.phase_start_time = None
                 for session in self.sessions.values():
                     session.ready = False
                 await self.broadcast_lobby()
@@ -386,6 +415,7 @@ class AutoBattlerServer:
         self.combat_start_time = None
         self.accel_started = False
         self.round_number += 1
+        self.phase_start_time = None
         for session in self.sessions.values():
             session.ready = False
         await self.broadcast_state()
