@@ -7,6 +7,8 @@ from typing import Dict, List, Optional, Tuple
 from pathlib import Path
 
 import pygame
+import numpy as np
+import cv2
 
 from board import HexTile, build_board
 from config import (
@@ -50,7 +52,8 @@ class AssetCache:
         self.raw_cache: Dict[str, Optional[pygame.Surface]] = {}
 
     def get_sprite(self, unit_type: str, mode: str) -> Optional[pygame.Surface]:
-        return self.get_sprite_scaled(unit_type, mode, (70, 70) if mode == "idle" else (74, 74))
+        # Slightly larger in-game sprites while keeping aspect ratio.
+        return self.get_sprite_scaled(unit_type, mode, (84, 84) if mode == "idle" else (90, 90))
 
     def get_sprite_scaled(self, unit_type: str, mode: str, size: Tuple[int, int]) -> Optional[pygame.Surface]:
         key = f"{unit_type}:{mode}:{size[0]}x{size[1]}"
@@ -93,7 +96,13 @@ class AssetCache:
         raw = self._load_raw(filename)
         if raw is None:
             return None
-        return pygame.transform.smoothscale(raw, size)
+        target_w, target_h = size
+        orig_w, orig_h = raw.get_width(), raw.get_height()
+        # Keep aspect ratio while fitting inside the requested box.
+        scale = min(target_w / orig_w, target_h / orig_h)
+        scaled_w = max(1, int(orig_w * scale))
+        scaled_h = max(1, int(orig_h * scale))
+        return pygame.transform.smoothscale(raw, (scaled_w, scaled_h))
 
     def _load_image(self, filename: Optional[str], scale: Tuple[int, int]) -> Optional[pygame.Surface]:
         # Legacy helper kept for compatibility; now uses raw + smoothscale.
@@ -203,7 +212,22 @@ class AutoBattlerClient:
         self.board_max_x = max(t.center_x for t in board_tiles)
         self.board_mid_x = (self.board_min_x + self.board_max_x) / 2.0
         self.board_mid_y = (self.board_min_y + self.board_max_y) / 2.0
+        self.depth_min_y = self.board_min_y
+        self.depth_max_y = max(t.center_y for t in self.tiles)
+        self.setup_camera()
         self.shop_slots = self.build_shop()
+        
+        # Load video background
+        video_path = self.assets.base / "background.mp4"
+        if video_path.exists():
+            self.video_cap = cv2.VideoCapture(str(video_path))
+            self.video_frame = None
+        else:
+            self.video_cap = None
+            self.video_frame = None
+            
+        # Toggle for projecting video onto 3D ground plane
+        self.project_video_on_ground = False
 
     def build_shop(self) -> List[Dict]:
         slots: List[Dict] = []
@@ -297,6 +321,109 @@ class AutoBattlerClient:
                 self.is_flipped = True
                 return
 
+    def setup_camera(self) -> None:
+        # Define Camera (Eye) and Target (At)
+        # We want to look at the center of the board from a high angle.
+        # World coordinates: X=pixel_x, Y=pixel_y, Z=0 (flat board)
+        # We treat Y as "depth" (increasing Y goes "down" on screen, so we look from high Y to low Y?)
+        # Actually, let's keep it simple:
+        # Camera is at (mid_x, max_y + offset, height)
+        # Looking at (mid_x, min_y + offset, 0)
+        
+        eye = np.array([self.board_mid_x, self.board_max_y + 400, 600], dtype=np.float32)
+        target = np.array([self.board_mid_x, self.board_min_y, 0], dtype=np.float32)
+        up = np.array([0, 0, -1], dtype=np.float32) # Z is up? No, Y is down in screen. 
+        # Let's define a standard coordinate system for the calculation then map to screen.
+        # Let's say:
+        # World X = Right
+        # Standard Right-Handed Coordinate System
+        # +X: Right
+        # +Y: Forward (North) -> Corresponds to Up on Screen (Small Screen Y)
+        # +Z: Up (Height)
+
+        # Board Center in World Coords
+        # We map Screen (x, y) -> World (x, -y, 0)
+        # This means Screen Top (Small Y) -> World High Y (North)
+        # Screen Bottom (Large Y) -> World Low Y (South)
+        world_cx = self.board_mid_x
+        world_cy = -self.board_mid_y
+
+        # Camera Position (Eye)
+        # Positioned "South" (negative Y relative to center) and "Up" (positive Z)
+        # Looking "North" (positive Y)
+        
+        cam_dist = 600.0  # Distance back from center
+        cam_height = 450.0 # Height above ground
+        
+        # Shift camera south to move board UP on screen
+        # Looking at a point south of the board center puts the board center "North" (Up) of the screen center.
+        offset_y = 150.0 
+        
+        # Eye is south of center
+        eye = np.array([world_cx, world_cy - cam_dist - offset_y, cam_height], dtype=np.float32)
+        # Look at center (shifted)
+        target = np.array([world_cx, world_cy - offset_y, 0], dtype=np.float32)
+        # Up is +Z
+        up = np.array([0, 0, 1], dtype=np.float32)
+
+        # View Matrix (LookAt)
+        fwd = target - eye
+        fwd /= np.linalg.norm(fwd)
+        
+        right = np.cross(fwd, up)
+        right /= np.linalg.norm(right)
+        
+        true_up = np.cross(right, fwd)
+        
+        self.view_mat = np.identity(4)
+        self.view_mat[0, :3] = right
+        self.view_mat[1, :3] = true_up
+        self.view_mat[2, :3] = -fwd
+        self.view_mat[0, 3] = -np.dot(right, eye)
+        self.view_mat[1, 3] = -np.dot(true_up, eye)
+        self.view_mat[2, 3] = np.dot(fwd, eye)
+        
+        # Projection Matrix
+        fov_deg = 45
+        aspect = SCREEN_WIDTH / SCREEN_HEIGHT
+        near = 10.0
+        far = 5000.0
+        
+        f = 1.0 / np.tan(np.radians(fov_deg) / 2)
+        self.proj_mat = np.zeros((4, 4))
+        self.proj_mat[0, 0] = f / aspect
+        self.proj_mat[1, 1] = f
+        self.proj_mat[2, 2] = (far + near) / (near - far)
+        self.proj_mat[2, 3] = (2 * far * near) / (near - far)
+        self.proj_mat[3, 2] = -1.0
+        
+        # Viewport Matrix
+        # NDC [-1, 1] -> Screen [0, W] x [0, H]
+        # NDC Y=+1 (Top) -> Screen Y=0
+        # NDC Y=-1 (Bottom) -> Screen Y=H
+        
+        self.viewport_mat = np.identity(4)
+        self.viewport_mat[0, 0] = SCREEN_WIDTH / 2
+        self.viewport_mat[0, 3] = SCREEN_WIDTH / 2
+        self.viewport_mat[1, 1] = -SCREEN_HEIGHT / 2 # Flip Y because Screen Y is down
+        self.viewport_mat[1, 3] = SCREEN_HEIGHT / 2
+        
+        self.vp_matrix = self.viewport_mat @ self.proj_mat @ self.view_mat
+
+    def project_point(self, x: float, y: float) -> Tuple[int, int]:
+        """Apply a true 3D perspective projection using numpy matrices."""
+        # Map Screen (x, y) to World (x, -y, 0)
+        vec = np.array([x, -y, 0, 1.0], dtype=np.float32)
+        
+        # Transform
+        res = self.vp_matrix @ vec
+        
+        # Perspective divide
+        if res[3] != 0:
+            res /= res[3]
+            
+        return int(res[0]), int(res[1])
+
     # --- UI Helpers ---
     def bench_slots(self, bench_count: int) -> List[Tuple[int, int]]:
         bench_tiles = sorted([t for t in self.tiles if t.is_bench], key=lambda t: t.col)
@@ -316,7 +443,8 @@ class AutoBattlerClient:
         best_tile = None
         best_dist = float("inf")
         for tile in self.tiles:
-            dist = math.hypot(tile.center_x - px, tile.center_y - py)
+            tx, ty = self.project_point(tile.center_x, tile.center_y)
+            dist = math.hypot(tx - px, ty - py)
             if dist < best_dist:
                 best_dist = dist
                 best_tile = tile
@@ -342,8 +470,30 @@ class AutoBattlerClient:
                 fill = BENCH_TILE_COLOR
             else:
                 fill = FRIENDLY_TILE_COLOR if tile.side == "friendly" else ENEMY_TILE_COLOR
-            pygame.draw.polygon(self.screen, fill, points)
-            pygame.draw.polygon(self.screen, (30, 30, 40), points, 2)
+            proj_points = [self.project_point(px, py) for px, py in points]
+            
+            # Thickness logic
+            thickness = 10
+            # Darker color for the base/sides
+            base_color = (max(0, fill[0] - 40), max(0, fill[1] - 40), max(0, fill[2] - 40))
+            
+            # Base points (shifted down in screen Y)
+            base_points = [(x, y + thickness) for x, y in proj_points]
+            
+            # Draw sides (Quads connecting Top and Base)
+            # We draw all sides; the Top polygon will cover the back ones.
+            # To ensure correct occlusion of sides by themselves, we could just draw them.
+            # Since the Top covers the center, we only see the "skirt".
+            for i in range(6):
+                p1 = proj_points[i]
+                p2 = proj_points[(i + 1) % 6]
+                b1 = base_points[i]
+                b2 = base_points[(i + 1) % 6]
+                pygame.draw.polygon(self.screen, base_color, [p1, p2, b2, b1])
+            
+            # Draw top
+            pygame.draw.polygon(self.screen, fill, proj_points)
+            pygame.draw.polygon(self.screen, (30, 30, 40), proj_points, 2)
 
     def draw_units(self) -> None:
         # Draw board units from authoritative state, with local mirroring if needed.
@@ -368,6 +518,11 @@ class AutoBattlerClient:
             is_attacking = self.phase == "combat" and self.server_tick - unit.get("attack_at", -999) < ATTACK_FLASH_TICKS
             sprite = self.assets.get_sprite(unit["type"], "attack" if is_attacking else "idle")
             is_enemy = self.player_id is not None and unit.get("owner") != self.player_id
+            # Soft shadow on the ground plane for depth
+            shadow_w, shadow_h = 52, 18
+            shadow = pygame.Surface((shadow_w, shadow_h), pygame.SRCALPHA)
+            pygame.draw.ellipse(shadow, (0, 0, 0, 80), shadow.get_rect())
+            self.screen.blit(shadow, (x - shadow_w // 2, y - shadow_h // 2 + 16))
             if sprite:
                 rect = sprite.get_rect(center=(x, y))
                 self.screen.blit(sprite, rect)
@@ -388,8 +543,13 @@ class AutoBattlerClient:
         )
         slots = self.bench_slots(max(len(bench_units), 1))
         for idx, unit in enumerate(bench_units):
-            x, y = slots[idx]
+            base_x, base_y = slots[idx]
+            x, y = self.project_point(base_x, base_y)
             sprite = self.assets.get_sprite_scaled(unit["type"], "idle", BENCH_ICON_SIZE)
+            shadow_w, shadow_h = 46, 16
+            shadow = pygame.Surface((shadow_w, shadow_h), pygame.SRCALPHA)
+            pygame.draw.ellipse(shadow, (0, 0, 0, 70), shadow.get_rect())
+            self.screen.blit(shadow, (x - shadow_w // 2, y - shadow_h // 2 + 12))
             if sprite:
                 rect = sprite.get_rect(center=(x, y))
                 self.screen.blit(sprite, rect)
@@ -408,6 +568,10 @@ class AutoBattlerClient:
                 if bullet.get("match_id") != self.current_match_id:
                     continue
             x, y = self.render_bullet_pos(bullet)
+            shadow_w, shadow_h = 14, 6
+            shadow = pygame.Surface((shadow_w, shadow_h), pygame.SRCALPHA)
+            pygame.draw.ellipse(shadow, (0, 0, 0, 60), shadow.get_rect())
+            self.screen.blit(shadow, (x - shadow_w // 2, y - shadow_h // 2 + 6))
             pygame.draw.circle(self.screen, (240, 240, 60), (x, y), 5)
 
     def draw_ui(self) -> None:
@@ -524,23 +688,23 @@ class AutoBattlerClient:
         x, y = float(unit.get("x", 0)), float(unit.get("y", 0))
         tile_id = unit.get("tile_id")
         if self.player_id is None:
-            return int(x), int(y)
+            return self.project_point(x, y)
         # Only flip if we are the top player in the pair
         if self.is_flipped:
             rx = self.board_mid_x - (x - self.board_mid_x)
             ry = self.board_mid_y - (y - self.board_mid_y)
-            return int(rx), int(ry)
-        return int(x), int(y)
+            return self.project_point(rx, ry)
+        return self.project_point(x, y)
 
     def render_bullet_pos(self, bullet: Dict) -> Tuple[int, int]:
         x, y = float(bullet.get("x", 0)), float(bullet.get("y", 0))
         if self.player_id is None:
-            return int(x), int(y)
+            return self.project_point(x, y)
         if self.is_flipped:
             rx = self.board_mid_x - (x - self.board_mid_x)
             ry = self.board_mid_y - (y - self.board_mid_y)
-            return int(rx), int(ry)
-        return int(x), int(y)
+            return self.project_point(rx, ry)
+        return self.project_point(x, y)
 
     def draw_shop(self) -> None:
         mouse_pos = pygame.mouse.get_pos()
@@ -594,7 +758,8 @@ class AutoBattlerClient:
         for unit in self.units:
             if unit.get("owner") != self.player_id or unit.get("status") != "board":
                 continue
-            dist = math.hypot(unit.get("x", 0) - px, unit.get("y", 0) - py)
+            ux, uy = self.render_pos(unit)
+            dist = math.hypot(ux - px, uy - py)
             if dist < 24:
                 self.drag_from_bench = False
                 return unit["id"]
@@ -606,7 +771,7 @@ class AutoBattlerClient:
         )
         slots = self.bench_slots(max(len(bench_units), 1))
         for idx, unit in enumerate(bench_units):
-            x, y = slots[idx]
+            x, y = self.project_point(*slots[idx])
             if math.hypot(x - px, y - py) < 20:
                 self.drag_from_bench = True
                 return unit["id"]
@@ -701,6 +866,75 @@ class AutoBattlerClient:
                     self.drag_pos = event.pos
 
             self.screen.fill(BG_COLOR)
+            
+            self.screen.fill(BG_COLOR)
+            
+            # Update and draw video background
+            if self.video_cap and self.video_cap.isOpened():
+                ret, frame = self.video_cap.read()
+                if not ret:
+                    # Loop video
+                    self.video_cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                    ret, frame = self.video_cap.read()
+                
+                if ret:
+                    # Convert BGR to RGB
+                    frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    
+                    if self.project_video_on_ground:
+                        # Define World Plane for Video (Large rectangle on Z=0)
+                        # Center matches board center
+                        wcx = self.board_mid_x
+                        wcy = -self.board_mid_y
+                        # Size of the "rug"
+                        # Reduced from 4000 to 3000 to "zoom out" the background texture
+                        w_size = 4000
+                        h_size = 4000
+                        
+                        # World Corners: TL, TR, BR, BL
+                        # Note: Y is North (+), X is Right (+)
+                        world_corners = [
+                            (wcx - w_size/2, wcy + h_size/2), # TL (North-West)
+                            (wcx + w_size/2, wcy + h_size/2), # TR (North-East)
+                            (wcx + w_size/2, wcy - h_size/2), # BR (South-East)
+                            (wcx - w_size/2, wcy - h_size/2), # BL (South-West)
+                        ]
+                        
+                        # Project to Screen Coordinates
+                        # project_point takes (x, y) where y is mapped to -WorldY
+                        # So we pass (wx, -wy)
+                        screen_corners = []
+                        for wx, wy in world_corners:
+                            sx, sy = self.project_point(wx, -wy)
+                            screen_corners.append([sx, sy])
+                        
+                        dst_points = np.array(screen_corners, dtype=np.float32)
+                        
+                        # Source points (Video frame corners)
+                        h, w = frame.shape[:2]
+                        src_points = np.array([
+                            [0, 0],
+                            [w, 0],
+                            [w, h],
+                            [0, h]
+                        ], dtype=np.float32)
+                        
+                        # Compute Homography
+                        matrix = cv2.getPerspectiveTransform(src_points, dst_points)
+                        
+                        # Warp
+                        # We warp to the full screen size
+                        # Use LANCZOS4 for better quality (sharper results)
+                        warped = cv2.warpPerspective(frame, matrix, (SCREEN_WIDTH, SCREEN_HEIGHT), flags=cv2.INTER_LANCZOS4)
+                        
+                        self.video_frame = pygame.image.frombuffer(warped.tobytes(), warped.shape[1::-1], "RGB")
+                        self.screen.blit(self.video_frame, (0, 0))
+                    else:
+                        # Normal 2D background rendering
+                        frame = cv2.resize(frame, (SCREEN_WIDTH, SCREEN_HEIGHT))
+                        self.video_frame = pygame.image.frombuffer(frame.tobytes(), frame.shape[1::-1], "RGB")
+                        self.screen.blit(self.video_frame, (0, 0))
+            
             if self.scene == "lobby":
                 self.draw_lobby()
             else:
